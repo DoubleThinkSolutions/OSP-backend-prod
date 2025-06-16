@@ -1,0 +1,111 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  osp-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: osp-backend-prod:latest
+    container_name: osp_backend_service
+    env_file: .env
+    environment:
+      # Ensure DEBUG=False is set in .env for this to simulate production
+      - DATABASE_URL=postgresql+asyncpg://osp_user:${POSTGRES_PASSWORD}@postgres_db:5432/${POSTGRES_DB_NAME}
+      - CELERY_BROKER_URL=redis://redis_broker:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis_broker:6379/0
+      - S3_ENDPOINT_URL=http://minio_storage:9000
+      - S3_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+      - S3_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - S3_BUCKET_NAME=${MINIO_DEFAULT_BUCKET}
+      - S3_ENABLED=True
+      - S3_USE_SSL=False
+      # For Gunicorn workers inside container:
+      - WEB_CONCURRENCY=4 # Example, adjust based on CPU
+    # Remove volumes: - ./app:/app/app for production builds (code is baked into image)
+    # If you need to mount a directory for *persistent uploads* when not using S3 (e.g. TEMP_UPLOAD_DIR),
+    # you could add a volume for that, but S3 is preferred for prod.
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres_db: { condition: service_healthy } # Wait for DB to be healthy
+      redis_broker: { condition: service_healthy } # Wait for Redis
+      minio_storage: { condition: service_healthy } # Wait for MinIO
+    restart: unless-stopped
+    networks:
+      - osp_network
+
+  osp-celery-worker:
+    build: # Can use same context and Dockerfile if dependencies are aligned
+      context: .
+      dockerfile: Dockerfile
+    image: osp-backend-prod:latest # Use same image
+    container_name: osp_celery_worker
+    command: celery -A app.celery_app.celery_app worker -l INFO --concurrency=4 # Adjust concurrency
+    env_file: .env
+    environment: # Similar to osp-backend
+      - DATABASE_URL=postgresql+asyncpg://osp_user:${POSTGRES_PASSWORD}@postgres_db:5432/${POSTGRES_DB_NAME}
+      - CELERY_BROKER_URL=redis://redis_broker:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis_broker:6379/0
+      - S3_ENDPOINT_URL=http://minio_storage:9000
+      - S3_ACCESS_KEY_ID=${MINIO_ROOT_USER}
+      - S3_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
+      - S3_BUCKET_NAME=${MINIO_DEFAULT_BUCKET}
+      - S3_ENABLED=True
+      - S3_USE_SSL=False
+      - API_KEY_PEPPER=${API_KEY_PEPPER} # Ensure Celery tasks have necessary config
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+    # Remove volumes: - ./app:/app/app for production
+    depends_on:
+      postgres_db: { condition: service_healthy }
+      redis_broker: { condition: service_healthy }
+      minio_storage: { condition: service_healthy }
+    restart: unless-stopped
+    networks:
+      - osp_network
+
+  # ... (postgres_db, redis_broker, minio_storage services remain largely the same as Turn 7) ...
+  # Ensure their environment variables are sourced from .env correctly.
+
+  # --- Basic Prometheus & Grafana (Optional, for local full-stack demo) ---
+  # prometheus:
+  #   image: prom/prometheus:v2.47.0
+  #   container_name: osp_prometheus
+  #   volumes:
+  #     - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml # You'd need this file
+  #   ports:
+  #     - "9090:9090"
+  #   networks:
+  #     - osp_network
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - osp-backend # So Prometheus can scrape it
+
+  # grafana:
+  #   image: grafana/grafana:10.1.1
+  #   container_name: osp_grafana
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - GF_SECURITY_ADMIN_USER=admin
+  #     - GF_SECURITY_ADMIN_PASSWORD=grafana_strong_password # Change this
+  #     # - GF_AUTH_ANONYMOUS_ENABLED=true # For easy access in demo
+  #     # - GF_INSTALL_PLUGINS= # If you need specific plugins
+  #   volumes:
+  #     - grafana_data:/var/lib/grafana
+  #     # - ./monitoring/grafana_datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+  #     # - ./monitoring/grafana_dashboards:/etc/grafana/provisioning/dashboards # For pre-configured dashboards
+  #   networks:
+  #     - osp_network
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - prometheus
+
+networks:
+  osp_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  minio_data:
+  # grafana_data: # If using Grafana service

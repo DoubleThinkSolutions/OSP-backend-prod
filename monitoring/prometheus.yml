@@ -1,0 +1,7 @@
+# monitoring/prometheus.yml
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: 'osp-backend'
+    static_configs:
+      - targets: ['osp-backend:8000'] # Docker compose service name and port
