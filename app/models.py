@@ -16,10 +16,14 @@ class Device(Base):
     last_seen_at = Column(DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow)
     is_active = Column(Boolean, default=True)
 
+    # --- NEW: Link to the owning user ---
+    owner_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    owner = relationship("User", back_populates="devices")
+
+    # --- DEPRECATED: Remove APIKey relationship ---
+    # api_key_entry = relationship("APIKey", back_populates="device", uselist=False, cascade="all, delete-orphan")
+
     manifests = relationship("Manifest", back_populates="device")
-    # Change to one-to-one relationship with APIKey for this simplified model
-    # If a device could have multiple keys, this would be a list (back_populates="api_keys")
-    api_key_entry = relationship("APIKey", back_populates="device", uselist=False, cascade="all, delete-orphan")
 
 class Manifest(Base):
     __tablename__ = "manifests"
@@ -48,43 +52,6 @@ class Manifest(Base):
     device = relationship("Device", back_populates="manifests")
     # Relationship to Segments
     segments = relationship("Segment", back_populates="manifest", cascade="all, delete-orphan")
-
-
-class Segment(Base):
-    __tablename__ = "segments"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    manifest_id = Column(UUID(as_uuid=True), ForeignKey("manifests.id"), nullable=False)
-    
-    segment_index = Column(Integer, nullable=False)
-    client_filename = Column(String, nullable=True) # Filename as reported by client for this segment
-    
-    # Hashes
-    sha256_hash_client = Column(String(64), nullable=False)
-    sha256_hash_server = Column(String(64), nullable=True, index=True) # Calculated by server
-    
-    duration_sec = Column(Float, nullable=False)
-    totp_codes_json = Column(JSON, nullable=False) # Store list of TOTP codes as JSON array
-    
-    # Storage info
-    storage_type = Column(String, default="LOCAL_TEMP") # e.g., S3_MINIO, IPFS
-    storage_path_uri = Column(String, nullable=True, index=True) # e.g., s3://bucket/path/to/file
-    file_size_bytes = Column(Integer, nullable=True)
-
-    # Verification & Trust
-    hash_verified_status = Column(String, default="PENDING", index=True) # PENDING, MATCH, MISMATCH
-    # totp_consistency_score = Column(Float, nullable=True)
-    # telemetry_plausibility_score = Column(Float, nullable=True)
-    # segment_trust_score = Column(Float, nullable=True)
-
-    created_at = Column(DateTime, default=dt.datetime.utcnow)
-
-    manifest = relationship("Manifest", back_populates="segments")
-
-    # Add a unique constraint for manifest_id and segment_index
-    # __table_args__ = (UniqueConstraint('manifest_id', 'segment_index', name='_manifest_segment_uc'),)
-    # Note: For async, UniqueConstraint needs to be handled carefully or at DB level.
-    # For now, application logic should ensure uniqueness before insertion.
 
 class Segment(Base):
     __tablename__ = "segments"
@@ -138,16 +105,12 @@ class User(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
-    
     full_name = Column(String, nullable=True)
     is_active = Column(Boolean, default=True)
-    is_superuser = Column(Boolean, default=False) # For admin privileges
-    
-    # Basic role field (could be an Enum or a separate Role table for more complexity)
-    role = Column(String, default="user", nullable=False) # e.g., "user", "admin", "auditor"
-
+    is_superuser = Column(Boolean, default=False)
+    role = Column(String, default="user", nullable=False)
     created_at = Column(DateTime, default=dt.datetime.utcnow)
     updated_at = Column(DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow)
 
-    # Relationships (if users own devices or have specific permissions)
-    # Example: devices = relationship("Device", back_populates="owner_user") # If users own devices
+    # Add the relationship to devices owned by this user
+    devices = relationship("Device", back_populates="owner")

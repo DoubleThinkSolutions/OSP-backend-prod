@@ -130,36 +130,30 @@ class SegmentQueryFilters(BaseModel):
     hash_verified_status: Optional[str] = Field(None, description="Filter by hash verification status")
     storage_type: Optional[str] = Field(None, description="Filter by storage type")
 
-# --- API Key Schemas ---
-class APIKeyBase(BaseSchema):
-    prefix: str # For display/identification
-    is_active: bool = True
-    expires_at: Optional[dt.datetime] = None
+# --- Device Schemas (Updated) ---
+class DeviceBase(BaseSchema):
+    device_id_str: str = Field(..., description="Unique string identifier for the device")
     description: Optional[str] = None
 
-class APIKeyCreateInternal(BaseModel): # Used internally, not exposed directly via API for creation
-    hashed_key: str
-    prefix: str
-    device_db_id: UUID4
-    is_active: bool = True
-    expires_at: Optional[dt.datetime] = None
-    description: Optional[str] = None
+class DeviceCreate(DeviceBase):
+    # This schema will be used to associate a device with an authenticated user
+    pass
 
-class APIKeyInDB(APIKeyBase):
+class DeviceInDB(DeviceBase):
     id: UUID4
-    device_db_id: UUID4 # So we know which device it belongs to if fetching keys directly
+    owner_user_id: UUID4 # Show which user owns this device
     created_at: dt.datetime
-    last_used_at: Optional[dt.datetime] = None
+    last_seen_at: dt.datetime
+    is_active: bool
 
-# --- Device Registration / Key Issuance (Example - more complex in reality) ---
-class DeviceRegistrationRequest(BaseModel):
-    device_id_str: str = Field(..., description="Proposed unique string identifier for the new device")
+# --- Device Registration Schemas (Updated) ---
+class DeviceAssociateRequest(BaseModel): # Renamed for clarity
+    device_id_str: str = Field(..., description="The unique string ID of the device to associate with the current user.")
     description: Optional[str] = None
-    # In a real system, might include a public key for the device, attestation data, etc.
 
-class DeviceRegistrationResponse(DeviceInDB): # Inherit DeviceInDB fields
-    api_key: str = Field(..., description="The newly generated API key for the device. STORE THIS SECURELY. It will not be shown again.")
-    api_key_prefix: str # Show prefix for identification
+# The response can now just be the standard DeviceInDB schema
+class DeviceAssociateResponse(DeviceInDB):
+    pass
 
 # --- User Schemas ---
 class UserBase(BaseSchema):

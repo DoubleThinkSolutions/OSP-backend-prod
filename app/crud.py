@@ -200,56 +200,38 @@ async def update_segment_server_hash(
         return db_segment
     return None
 
-# --- APIKey CRUD ---
-async def create_api_key_for_device(
-    db: AsyncSession, 
-    device_db_id: uuid.UUID, 
-    hashed_key: str, 
-    prefix: str,
-    description: Optional[str] = "Device API Key",
-    expires_at: Optional[dt.datetime] = None
-) -> models.APIKey:
-    db_api_key = models.APIKey(
-        device_db_id=device_db_id,
-        hashed_key=hashed_key,
-        prefix=prefix,
-        description=description,
-        expires_at=expires_at,
+async def create_device_for_user(
+    db: AsyncSession,
+    device_create_schema: schemas.DeviceCreate,
+    owner_user_id: uuid.UUID
+) -> models.Device:
+    """Create a new device owned by a specific user."""
+    db_device = models.Device(
+        device_id_str=device_create_schema.device_id_str,
+        description=device_create_schema.description,
+        owner_user_id=owner_user_id, # Link to the user
+        created_at=dt.datetime.utcnow(),
+        last_seen_at=dt.datetime.utcnow(),
         is_active=True
     )
-    db.add(db_api_key)
-    await db.flush([db_api_key]) # Ensure ID is populated
-    return db_api_key
+    db.add(db_device)
+    await db.flush([db_device])
+    return db_device
 
-async def get_api_key_by_prefix(db: AsyncSession, prefix: str) -> Optional[models.APIKey]:
-    """Retrieve an API key entry by its prefix (for initial lookup)."""
+async def get_device_for_user(
+    db: AsyncSession,
+    device_id_str: str,
+    owner_user_id: uuid.UUID
+) -> Optional[models.Device]:
+    """Get a device only if it belongs to the specified user."""
     result = await db.execute(
-        select(models.APIKey)
-        .options(selectinload(models.APIKey.device)) # Eager load device
-        .filter(models.APIKey.prefix == prefix)
+        select(models.Device)
+        .filter(
+            models.Device.device_id_str == device_id_str,
+            models.Device.owner_user_id == owner_user_id
+        )
     )
     return result.scalar_one_or_none()
-
-async def update_api_key_last_used(db: AsyncSession, api_key_id: uuid.UUID):
-    """Update the last_used_at timestamp for an API key."""
-    stmt = (
-        update(models.APIKey)
-        .where(models.APIKey.id == api_key_id)
-        .values(last_used_at=dt.datetime.utcnow())
-        .execution_options(synchronize_session="fetch") # To update session objects
-    )
-    await db.execute(stmt)
-    # No need to commit here, session manager handles it.
-
-async def deactivate_api_key(db: AsyncSession, api_key_id: uuid.UUID) -> Optional[models.APIKey]:
-    db_api_key = await db.get(models.APIKey, api_key_id) # Simpler get by PK
-    if db_api_key:
-        db_api_key.is_active = False
-        db_api_key.last_used_at = dt.datetime.utcnow() # Also update last used
-        # db.add(db_api_key)
-        await db.flush([db_api_key])
-        return db_api_key
-    return None
 
 # --- User CRUD ---
 async def get_user_by_id(db: AsyncSession, user_id: uuid.UUID) -> Optional[models.User]:

@@ -26,8 +26,12 @@ from app.core.config import settings # Ensure settings is imported
 
 from app import security # Import new security utils
 from app.models import Device as DeviceModel # For type hinting in auth
-from app.auth_deps import get_current_user, get_current_active_admin_user, authenticate_device_api_key # Import new auth deps
-
+from app.auth_deps import (
+    get_current_user,
+    get_current_active_admin_user,
+    # authenticate_device_api_key, # Deprecated
+    authenticate_admin_api_key # Keep for admin tasks
+)
 import logging # For standard logging
 from app.core.logging_config import setup_logging # Import our logging setup
 from prometheus_client import Histogram # For request latency histogram
@@ -343,47 +347,6 @@ async def read_device_by_str_id(device_id_str: str, db: AsyncSession = Depends(g
 # --- API Key Authentication (Using Database) ---
 api_key_header_device = APIKeyHeader(name="X-DEVICE-API-KEY", auto_error=False) # auto_error=False to customize response
 
-async def authenticate_device_api_key(
-    db: AsyncSession = Depends(get_db_session),
-    api_key_value: Optional[str] = Security(api_key_header_device)
-) -> DeviceModel: # Return the authenticated Device model instance
-    if not api_key_value:
-        ingestion_errors_total.labels(error_type='auth_missing_key').inc()
-        raise HTTPException(status_code=401, detail="X-DEVICE-API-KEY header missing.")
-
-    key_prefix = api_key_value[:security.API_KEY_PREFIX_LENGTH]
-    db_api_key_entry = await crud.get_api_key_by_prefix(db, prefix=key_prefix)
-
-    if not db_api_key_entry:
-        ingestion_errors_total.labels(error_type='auth_invalid_key_prefix').inc()
-        raise HTTPException(status_code=401, detail="Invalid API Key (prefix not found).")
-
-    if not db_api_key_entry.is_active:
-        ingestion_errors_total.labels(error_type='auth_inactive_key').inc()
-        raise HTTPException(status_code=401, detail="API Key is inactive.")
-        
-    if db_api_key_entry.expires_at and db_api_key_entry.expires_at < dt.datetime.utcnow():
-        # Optionally deactivate key here: await crud.deactivate_api_key(db, db_api_key_entry.id)
-        ingestion_errors_total.labels(error_type='auth_expired_key').inc()
-        raise HTTPException(status_code=401, detail="API Key has expired.")
-
-    if not security.verify_api_key(api_key_value, db_api_key_entry.hashed_key):
-        ingestion_errors_total.labels(error_type='auth_invalid_key_hash').inc()
-        # TODO: Implement lockout logic for repeated failures from an IP or prefix
-        raise HTTPException(status_code=401, detail="Invalid API Key (verification failed).")
-
-    # Key is valid, update last used and return the associated device
-    if not db_api_key_entry.device: # Should not happen if DB constraints are correct
-        ingestion_errors_total.labels(error_type='auth_key_no_device').inc()
-        raise HTTPException(status_code=500, detail="API Key is not associated with a device.")
-    
-    await crud.update_api_key_last_used(db, db_api_key_entry.id)
-    db_api_key_entry.device.last_seen_at = dt.datetime.utcnow() # Update device last_seen
-    # db.add(db_api_key_entry.device) # Mark device as dirty for last_seen_at update
-    # The session commit in get_db_session will handle this.
-    
-    return db_api_key_entry.device # Return the authenticated device object
-
 # --- Admin API Key Authentication (Example for registration endpoint) ---
 admin_api_key_header = APIKeyHeader(name="X-ADMIN-API-KEY", auto_error=False)
 async def authenticate_admin_api_key(admin_key_value: Optional[str] = Security(admin_api_key_header)):
@@ -392,47 +355,6 @@ async def authenticate_admin_api_key(admin_key_value: Optional[str] = Security(a
     if admin_key_value == settings.ADMIN_API_KEY:
         return True
     raise HTTPException(status_code=401, detail="Invalid X-ADMIN-API-KEY.")
-
-@app.post(
-    f"{API_ROUTER_V1_PREFIX}/devices/register",
-    response_model=schemas.DeviceRegistrationResponse,
-    status_code=201,
-    summary="Register a new device and issue an API key.",
-    description="Requires Admin API Key. Registers a new device based on its string ID "
-                "and returns the device details along with a new API key. "
-                "The returned API key must be stored securely by the client; it will not be shown again."
-)
-async def register_new_device(
-    registration_data: schemas.DeviceRegistrationRequest,
-    db: AsyncSession = Depends(get_db_session),
-    _is_admin: bool = Depends(authenticate_admin_api_key) # Protect this endpoint
-):
-    existing_device = await crud.get_device_by_str_id(db, device_id_str=registration_data.device_id_str)
-    if existing_device:
-        raise HTTPException(
-            status_code=409, # Conflict
-            detail=f"Device with device_id_str '{registration_data.device_id_str}' already exists."
-        )
-    
-    device_create_schema = schemas.DeviceCreate(
-        device_id_str=registration_data.device_id_str,
-        description=registration_data.description
-    )
-    db_device, raw_api_key = await crud.create_device_with_api_key(db, device_create_schema=device_create_schema)
-    
-    # We need to refresh db_device to get the api_key_entry populated by the relationship
-    await db.refresh(db_device, ['api_key_entry'])
-
-    return schemas.DeviceRegistrationResponse(
-        id=db_device.id,
-        device_id_str=db_device.device_id_str,
-        description=db_device.description,
-        created_at=db_device.created_at,
-        last_seen_at=db_device.last_seen_at,
-        is_active=db_device.is_active,
-        api_key=raw_api_key, # Return the raw key ONLY this one time
-        api_key_prefix=db_device.api_key_entry.prefix if db_device.api_key_entry else "ERROR_NO_KEY_PREFIX"
-    )
 
 # --- User and Authentication Endpoints ---
 @app.post(f"{API_ROUTER_V1_PREFIX}/users/token", response_model=schemas.Token, tags=["Authentication"])
@@ -495,6 +417,186 @@ async def read_all_users(
     """Retrieve all users (admin only)."""
     users = await crud.get_users(db, skip=skip, limit=limit)
     return users
+
+# NEW: Device Association Endpoint (replaces old device registration)
+@app.post(
+    f"{API_ROUTER_V1_PREFIX}/devices/associate",
+    response_model=schemas.DeviceAssociateResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Devices"],
+    summary="Associate a new device with the authenticated user.",
+    description=(
+        "Associates a device, identified by its unique string ID, with the currently "
+        "authenticated user (via JWT). If the device ID already exists but is owned "
+        "by another user, this will fail. If the device is already associated with "
+        "the current user, it returns the existing device details."
+    )
+)
+async def associate_device_with_user(
+    device_data: schemas.DeviceAssociateRequest,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: models.User = Depends(get_current_user) # PROTECTED BY USER JWT
+):
+    """
+    Endpoint for a logged-in user to claim ownership of a device.
+    """
+    logger.info(
+        "Device association request received.",
+        extra={"user_id": str(current_user.id), "device_id_str": device_data.device_id_str}
+    )
+    
+    existing_device = await crud.get_device_by_str_id(db, device_id_str=device_data.device_id_str)
+    
+    if existing_device:
+        if existing_device.owner_user_id == current_user.id:
+            logger.info(
+                "Device already associated with this user.",
+                extra={"device_id": str(existing_device.id), "user_id": str(current_user.id)}
+            )
+            return existing_device # Return 200 OK with existing device data (FastAPI handles status code if not 201)
+        else:
+            logger.warning(
+                "Attempt to associate a device already owned by another user.",
+                extra={"device_id_str": device_data.device_id_str, "requester_user_id": str(current_user.id)}
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Device with ID '{device_data.device_id_str}' is already registered to another user."
+            )
+
+    device_create_schema = schemas.DeviceCreate(
+        device_id_str=device_data.device_id_str,
+        description=device_data.description
+    )
+    
+    db_device = await crud.create_device_for_user(
+        db, device_create_schema=device_create_schema, owner_user_id=current_user.id
+    )
+    
+    logger.info(
+        "New device successfully associated with user.",
+        extra={"device_id": str(db_device.id), "user_id": str(current_user.id)}
+    )
+    
+    return db_device
+
+@app.post(
+    f"{API_ROUTER_V1_PREFIX}/ingest/evidence",
+    response_model=schemas.ManifestIngestionResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Ingestion"],
+    summary="Ingest evidence manifest and segments for the authenticated user's device.",
+    description=(
+        "Authenticates via a user's JWT Bearer token. The `device_id_str` within "
+        "the manifest payload must belong to the authenticated user. Submits a manifest "
+        "(as a JSON string) and a corresponding list of segment files."
+    )
+)
+async def ingest_evidence(
+    manifest_json_str: str = Form(..., description="Manifest data as a JSON string."),
+    segment_files: List[UploadFile] = File(..., description="List of segment files. Order must match segments_data in manifest."),
+    db: AsyncSession = Depends(get_db_session),
+    current_user: models.User = Depends(get_current_user) # Authenticate via user JWT
+):
+    """
+    The primary endpoint for submitting evidence from a device.
+    Authentication is handled by the user's JWT, which authorizes the device.
+    """
+    # 1. Parse and validate the manifest from the form data
+    try:
+        manifest_data_dict = json.loads(manifest_json_str)
+        manifest_create_schema = schemas.ManifestCreate(**manifest_data_dict)
+    except json.JSONDecodeError as e:
+        logger.error("Manifest ingestion failed due to invalid JSON.", extra={"error": str(e)})
+        ingestion_errors_total.labels(error_type='json_decode').inc()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON format for manifest_json_str.")
+    except Exception as e:
+        logger.error("Manifest ingestion failed due to validation error.", extra={"error": str(e)})
+        ingestion_errors_total.labels(error_type='validation').inc()
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Manifest validation error: {str(e)}")
+
+    if len(manifest_create_schema.segments_data) != len(segment_files):
+        ingestion_errors_total.labels(error_type='file_segment_mismatch').inc()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Mismatch between number of segments in manifest and number of uploaded files.")
+
+    # 2. Authorize: Verify the device in the manifest belongs to the authenticated user
+    device_id_from_manifest = manifest_create_schema.device_id_str
+    db_device = await crud.get_device_for_user(
+        db, device_id_str=device_id_from_manifest, owner_user_id=current_user.id
+    )
+
+    if not db_device:
+        logger.warning(
+            "Device authorization failed during ingestion.",
+            extra={"manifest_device_id": device_id_from_manifest, "authenticated_user_id": str(current_user.id)}
+        )
+        ingestion_errors_total.labels(error_type='auth_device_not_found_for_user').inc()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Device with ID '{device_id_from_manifest}' is not associated with your account."
+        )
+
+    # 3. Ingestion Logic (Identical to previous turns)
+    db_device.last_seen_at = dt.datetime.utcnow()
+    db_manifest = await crud.create_manifest(db, manifest=manifest_create_schema, device_db_id=db_device.id)
+
+    processed_segment_db_ids = []
+    for i, segment_meta_create in enumerate(manifest_create_schema.segments_data):
+        upload_file_segment = segment_files[i]
+        try:
+            storage_key, file_size, server_hash, storage_type = await file_storage_service.save_upload_file(
+                upload_file=upload_file_segment,
+                device_id_str=db_device.device_id_str,
+                manifest_db_id=db_manifest.id,
+                segment_index=segment_meta_create.segment_index
+            )
+            hash_status = "MATCH_SERVER_CLIENT" if server_hash == segment_meta_create.sha256_hash_client else "MISMATCH_SERVER_CLIENT"
+            db_segment = await crud.create_segment(
+                db, segment=segment_meta_create, manifest_id=db_manifest.id,
+                storage_path_uri=storage_key, storage_type=storage_type, file_size_bytes=file_size
+            )
+            db_segment.sha256_hash_server, db_segment.hash_verified_status = server_hash, hash_status
+            await db.flush([db_segment])
+            processed_segment_db_ids.append(db_segment.id)
+            files_uploaded_total.inc()
+        except Exception as e:
+            ingestion_errors_total.labels(error_type='file_processing').inc()
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error processing segment file: {str(e)}")
+
+    manifests_ingested_total.inc()
+    
+    # 4. Celery Task Dispatch (Identical to previous turns)
+    task_id_str = None
+    if settings.CELERY_ENABLED:
+        try:
+            task_submission = celery_app.send_task("app.tasks.process_manifest_verification", args=[str(db_manifest.id)])
+            task_id_str = str(task_submission.id)
+            db_manifest.server_verification_status = "QUEUED_FOR_VERIFICATION"
+        except Exception as celery_e:
+            logger.error(f"Celery dispatch failed for manifest {db_manifest.id}", extra={"error": str(celery_e)})
+            db_manifest.server_verification_status = "VERIFICATION_DISPATCH_FAILED"
+            ingestion_errors_total.labels(error_type='celery_dispatch').inc()
+    
+    # 5. Finalize and Return Response
+    await db.refresh(db_manifest)
+    
+    response_message = f"Manifest for device '{db_device.device_id_str}' ({len(processed_segment_db_ids)} segments) received."
+    if task_id_str:
+        response_message += f" Verification queued (Task ID: {task_id_str})."
+    
+    logger.info(
+        "Manifest ingestion successful.",
+        extra={
+            "manifest_id": str(db_manifest.id),
+            "user_id": str(current_user.id),
+            "device_id": str(db_device.id)
+        }
+    )
+    return schemas.ManifestIngestionResponse(
+        manifest_id=db_manifest.id,
+        message=response_message,
+        received_at_server=db_manifest.received_at_server
+    )
 
 # Placeholder for health check
 @app.get("/health", status_code=200)
